@@ -16,6 +16,7 @@ This module provides classes for plotting Pourbaix objects.
 import six
 from six.moves import map
 from six.moves import zip
+import warnings
 
 __author__ = "Sai Jayaraman"
 __copyright__ = "Copyright 2011, The Materials Project"
@@ -34,10 +35,10 @@ from pymatgen.analysis.pourbaix.analyzer import PourbaixAnalyzer
 from pymatgen.analysis.pourbaix.maker import PREFAC
 from pymatgen.analysis.pourbaix.entry import MultiEntry
 
-from pymatgen.phasediagram.plotter import uniquelines
+from pymatgen.analysis.phase_diagram import uniquelines
 from pymatgen.util.string import latexify
 from pymatgen.util.plotting import pretty_plot
-from pymatgen.util.coord_utils import in_coord_list
+from pymatgen.util.coord import in_coord_list
 
 
 class PourbaixPlotter(object):
@@ -202,6 +203,45 @@ class PourbaixPlotter(object):
             f.set_size_inches((11.5, 9))
             plt.tight_layout(pad=1.09)
 
+    def plot_entry_stability(self, entry, resolution=100, e_hull_max=1,
+                             **kwargs):
+        # plot the Pourbaix diagram
+        plt = self.get_pourbaix_plot(**kwargs)
+        ax = plt.gca()
+        ph_min, ph_max, v_min, v_max = ax.get_xlim() + ax.get_ylim()
+
+        # Get stability map
+        phs, vs = np.mgrid[ph_min:ph_max:resolution*1j, 
+                           v_min:v_max:resolution*1j]
+        if self._pd._multielement and not isinstance(entry, MultiEntry):
+            _, _, m_entries = self._analyzer.\
+                    get_all_decomp_and_e_above_hull(entry)
+            warnings.warn("{} is not a multi-entry, calculating stability of "
+                          "representative multientries".format(entry.name))
+            stability = [self._analyzer.get_entry_stability(m_entries[0], ph, v)
+                         for ph, v in zip(phs.ravel(), vs.ravel())]
+            for m_entry in m_entries[1:]:
+                new_stab = [self._analyzer.get_entry_stability(m_entry, ph, v)
+                            for ph, v in zip(phs.ravel(), vs.ravel())]
+                stability = np.min(np.array([stability, new_stab]), axis=0)
+        else:
+            stability = [self._analyzer.get_entry_stability(entry, ph, v)
+                         for ph, v in zip(phs.ravel(), vs.ravel())]
+        stability = np.array(stability).reshape(phs.shape)
+
+        # Plot stability map
+        plt.pcolor(phs, vs, stability, cmap='RdYlBu_r',
+                   vmin=0, vmax=e_hull_max)
+        cbar = plt.colorbar()
+        cbar.set_label("Stability of {} (eV)".format(self.print_name(entry)))
+
+        # Set ticklabels
+        ticklabels = [t.get_text() for t in cbar.ax.get_yticklabels()]
+        ticklabels[-1] = '>={}'.format(ticklabels[-1])
+        cbar.ax.set_yticklabels(ticklabels)
+
+        return plt
+
     def pourbaix_plot_data(self, limits=None):
         """
         Get data required to plot Pourbaix diagram.
@@ -323,10 +363,10 @@ class PourbaixPlotter(object):
                 mid_x = ((x2 - x1) / (y2 - y1)) * (cy_1 - y1) + x1
                 assert (x2 - mid_x) * (x1 - mid_x) <= 0.0
                 mid_x_list.append(mid_x)
-        upper_y = sorted([y for y in mid_y_list if y >= cy_1])[0]
-        lower_y = sorted([y for y in mid_y_list if y < cy_1])[-1]
-        left_x = sorted([x for x in mid_x_list if x <= cx_1])[-1]
-        right_x = sorted([x for x in mid_x_list if x > cx_1])[0]
+        upper_y = sorted([y for y in mid_y_list if y >= cy_1] + [cy_1])[0]
+        lower_y = sorted([y for y in mid_y_list if y < cy_1] + [cy_1])[-1]
+        left_x = sorted([x for x in mid_x_list if x <= cx_1] + [cx_1])[-1]
+        right_x = sorted([x for x in mid_x_list if x > cx_1] + [cx_1])[0]
         center_x = (left_x + right_x) / 2.0
         center_y = (upper_y + lower_y) / 2.0
         if h2o_h_line is not None:
@@ -350,7 +390,8 @@ class PourbaixPlotter(object):
                         center_y = h2o_y + radius
         return center_x, center_y
 
-    def get_pourbaix_plot(self, limits=None, title="", label_domains=True):
+    def get_pourbaix_plot(self, limits=[[-2, 14], [-3, 3]],
+                          title="", label_domains=True):
         """
         Plot Pourbaix diagram.
 
@@ -362,7 +403,6 @@ class PourbaixPlotter(object):
             plt:
                 matplotlib plot object
         """
-#        plt = pretty_plot(24, 14.4)
         plt = pretty_plot(16)
         (stable, unstable) = self.pourbaix_plot_data(limits)
         if limits:
@@ -413,7 +453,8 @@ class PourbaixPlotter(object):
                 continue
             xy = (center_x, center_y)
             if label_domains:
-                plt.annotate(self.print_name(entry), xy, fontsize=20, color="b")
+                plt.annotate(self.print_name(entry), xy, ha='center',
+                             va='center', fontsize=20, color="b")
 
         plt.xlabel("pH")
         plt.ylabel("E (V)")
@@ -624,7 +665,8 @@ class PourbaixPlotter(object):
     def get_pourbaix_plot_colorfill_by_domain_name(self, limits=None, title="",
             label_domains=True, label_color='k', domain_color=None, domain_fontsize=None,
             domain_edge_lw=0.5, bold_domains=None, cluster_domains=(),
-            add_h2o_stablity_line=True, add_center_line=False, h2o_lw=0.5):
+            add_h2o_stablity_line=True, add_center_line=False, h2o_lw=0.5,
+            fill_domain=True, width=8, height=None, font_family='Times New Roman'):
         """
         Color domains by the colors specific by the domain_color dict
 
@@ -638,16 +680,18 @@ class PourbaixPlotter(object):
             domain_fontsize (int): Font size used in domain text labels.
             domain_edge_lw (int): line width for the boundaries between domains.
             bold_domains (list): List of domain names to use bold text style for domain
-                lables.
+                lables. If set to False, no domain will be bold.
             cluster_domains (list): List of domain names in cluster phase
             add_h2o_stablity_line (Bool): whether plot H2O stability line
             add_center_line (Bool): whether plot lines shows the center coordinate
             h2o_lw (int): line width for H2O stability line and center lines
+            fill_domain (bool): a version without color will be product if set 
+                to False.
+            width (float): Width of plot in inches. Defaults to 8in.
+                height (float): Height of plot in inches. Defaults to width * golden
+                ratio.
+            font_family (str): Font family of the labels
         """
-        # helper functions
-        def len_elts(entry):
-            comp = Composition(entry[:-3]) if "(s)" in entry else Ion.from_formula(entry)
-            return len(set(comp.elements) - {Element("H"), Element("O")})
 
         def special_lines(xlim, ylim):
             h_line = np.transpose([[xlim[0], -xlim[0] * PREFAC],
@@ -659,83 +703,75 @@ class PourbaixPlotter(object):
             return h_line, o_line, neutral_line, V0_line
 
         from matplotlib.patches import Polygon
-        from pymatgen import Composition, Element
-        from pymatgen.core.ion import Ion
+        import copy
 
         default_domain_font_size = 12
         default_solid_phase_color = '#b8f9e7'    # this slighly darker than the MP scheme, to
         default_cluster_phase_color = '#d0fbef'  # avoid making the cluster phase too light
 
-        plt = pretty_plot(8, dpi=300)
+        plt = pretty_plot(width=width, height=height, dpi=300)
 
         (stable, unstable) = self.pourbaix_plot_data(limits)
-        num_of_overlaps = {key: 0 for key in stable.keys()}
-        entry_dict_of_multientries = collections.defaultdict(list)
-        for entry in stable:
-            if isinstance(entry, MultiEntry):
-                for e in entry.entrylist:
-                    entry_dict_of_multientries[e.name].append(entry)
-                    num_of_overlaps[entry] += 1
-            else:
-                entry_dict_of_multientries[entry.name].append(entry)
 
         xlim, ylim = limits[:2] if limits else self._analyzer.chempot_limits[:2]
         h_line, o_line, neutral_line, V0_line = special_lines(xlim, ylim)
         ax = plt.gca()
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
-        ax.xaxis.set_major_formatter(FormatStrFormatter('%.1f'))
+        ax.xaxis.set_major_formatter(FormatStrFormatter('%d'))
         ax.yaxis.set_major_formatter(FormatStrFormatter('%.1f'))
         ax.tick_params(direction='out')
         ax.xaxis.set_ticks_position('bottom')
         ax.yaxis.set_ticks_position('left')
 
-        sorted_entry = list(entry_dict_of_multientries.keys())
-        sorted_entry.sort(key=len_elts)
+        sorted_entry = list(stable.keys())
+        sorted_entry.sort(key=lambda en: en.energy, reverse=True)
 
         if domain_fontsize is None:
-            domain_fontsize = {en: default_domain_font_size for en in sorted_entry}
+            domain_fontsize = {en.name: default_domain_font_size for en in sorted_entry}
+        elif not isinstance(domain_fontsize, dict):
+            domain_fontsize = {en.name: domain_fontsize for en in sorted_entry}
         if domain_color is None:
-            domain_color = {en: default_solid_phase_color if '(s)' in en else
-                            (default_cluster_phase_color if en in cluster_domains else 'w')
+            domain_color = {en.name: default_solid_phase_color if '(s)' in en.name else
+                            (default_cluster_phase_color if en.name in cluster_domains else 'w')
+                            for i, en in enumerate(sorted_entry)}
+        else:
+            domain_color = {en.name: domain_color[en.name] if en.name in domain_color else "w"
                             for i, en in enumerate(sorted_entry)}
         if bold_domains is None:
-            bold_domains = [en for en in sorted_entry if '(s)' not in en]
+            bold_domains = [en.name for en in sorted_entry if '(s)' not in en.name]
+        if bold_domains == False:
+            bold_domains = []
 
         for entry in sorted_entry:
-            x_coord, y_coord, npts = 0.0, 0.0, 0
-            for e in entry_dict_of_multientries[entry]:
-                xy = self.domain_vertices(e)
-                if add_h2o_stablity_line:
-                    c = self.get_distribution_corrected_center(stable[e], h_line, o_line, 0.3)
-                else:
-                    c = self.get_distribution_corrected_center(stable[e])
-                x_coord += c[0]
-                y_coord += c[1]
-                npts += 1
-                patch = Polygon(xy, facecolor=domain_color[entry],
-                                closed=True, lw=domain_edge_lw, fill=True, antialiased=True)
-                ax.add_patch(patch)
-            xy_center = (x_coord / npts, y_coord / npts)
+            xy = self.domain_vertices(entry)
+            if add_h2o_stablity_line:
+                c = self.get_distribution_corrected_center(stable[entry], h_line, o_line, 0.3)
+            else:
+                c = self.get_distribution_corrected_center(stable[entry])
+            patch = Polygon(xy, facecolor=domain_color[entry.name], edgecolor="black",
+                            closed=True, lw=domain_edge_lw, fill=fill_domain, antialiased=True)
+            ax.add_patch(patch)
             if label_domains:
-                if platform.system() == 'Darwin':
+                if platform.system() == 'Darwin' and font_family == "Times New Roman":
                     # Have to hack to the hard coded font path to get current font On Mac OS X
-                    if entry in bold_domains:
+                    if entry.name in bold_domains:
                         font = FontProperties(fname='/Library/Fonts/Times New Roman Bold.ttf',
-                                              size=domain_fontsize[entry])
+                                              size=domain_fontsize[entry.name])
                     else:
                         font = FontProperties(fname='/Library/Fonts/Times New Roman.ttf',
-                                              size=domain_fontsize[entry])
+                                              size=domain_fontsize[entry.name])
                 else:
-                    if entry in bold_domains:
-                        font = FontProperties(family='Times New Roman',
+                    if entry.name in bold_domains:
+                        font = FontProperties(family=font_family,
                                               weight='bold',
-                                              size=domain_fontsize[entry])
+                                              size=domain_fontsize[entry.name])
                     else:
-                        font = FontProperties(family='Times New Roman',
+                        font = FontProperties(family=font_family,
                                               weight='regular',
-                                              size=domain_fontsize[entry])
-                plt.text(*xy_center, s=latexify_ion(latexify(entry)), fontproperties=font,
+                                              size=domain_fontsize[entry.name])
+                plt.text(*c, s=self.print_name(entry),
+                         fontproperties=font,
                          horizontalalignment="center", verticalalignment="center",
                          multialignment="center", color=label_color)
 
@@ -749,11 +785,11 @@ class PourbaixPlotter(object):
             plt.plot(neutral_line[0], neutral_line[1], "k-.", linewidth=h2o_lw, antialiased=False)
             plt.plot(V0_line[0], V0_line[1], "k-.", linewidth=h2o_lw, antialiased=False)
 
-        plt.xlabel("pH", fontname="Times New Roman", fontsize=18)
-        plt.ylabel("E (V)", fontname="Times New Roman", fontsize=18)
-        plt.xticks(fontname="Times New Roman", fontsize=16)
-        plt.yticks(fontname="Times New Roman", fontsize=16)
-        plt.title(title, fontsize=20, fontweight='bold', fontname="Times New Roman")
+        plt.xlabel("pH", fontname=font_family, fontsize=18)
+        plt.ylabel("E (V vs SHE)", fontname=font_family, fontsize=18)
+        plt.xticks(fontname=font_family, fontsize=16)
+        plt.yticks(fontname=font_family, fontsize=16)
+        plt.title(title, fontsize=20, fontweight='bold', fontname=font_family)
         return plt
 
     def get_pourbaix_mark_passive(self, limits=None, title="", label_domains=True, passive_entry=None):

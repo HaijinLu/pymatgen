@@ -6,7 +6,7 @@ This module provides utility classes for string operations.
 """
 from __future__ import unicode_literals
 import re
-
+from fractions import Fraction
 
 __author__ = "Shyue Ping Ong"
 __copyright__ = "Copyright 2011, The Materials Project"
@@ -63,7 +63,7 @@ def formula_double_format(afloat, ignore_ones=True, tol=1e-8):
 
 def latexify(formula):
     """
-    Generates a latex formatted formula. E.g., Fe2O3 is transformed to
+    Generates a LaTeX formatted formula. E.g., Fe2O3 is transformed to
     Fe$_{2}$O$_{3}$.
 
     Args:
@@ -75,10 +75,42 @@ def latexify(formula):
     return re.sub(r"([A-Za-z\(\)])([\d\.]+)", r"\1$_{\2}$", formula)
 
 
+def htmlify(formula):
+    """
+    Generates a HTML formatted formula, e.g. Fe2O3 is transformed to
+    Fe<sub>2</sub>O</sub>3</sub>
+
+    :param formula:
+    :return:
+    """
+    return re.sub(r"([A-Za-z\(\)])([\d\.]+)", r"\1<sub>\2</sub>", formula)
+
+
+def unicodeify(formula):
+    """
+    Generates a formula with unicode subscripts, e.g. Fe2O3 is transformed
+    to Fe₂O₃. Does not support formulae with decimal points.
+
+    :param formula:
+    :return:
+    """
+
+    if '.' in formula:
+        raise ValueError('No unicode character exists for subscript period.')
+
+    subscript_unicode_map = {0: '₀', 1: '₁', 2: '₂', 3: '₃', 4: '₄',
+                             5: '₅', 6: '₆', 7: '₇', 8: '₈', 9: '₉'}
+
+    for original_subscript, subscript_unicode in subscript_unicode_map.items():
+        formula = formula.replace(str(original_subscript), subscript_unicode)
+
+    return formula
+
+
 def latexify_spacegroup(spacegroup_symbol):
     """
     Generates a latex formatted spacegroup. E.g., P2_1/c is converted to
-    P2$_{1}$/c and P-1 is converted to P$\overline{1}$.
+    P2$_{1}$/c and P-1 is converted to P$\\overline{1}$.
 
     Args:
         spacegroup_symbol (str): A spacegroup symbol
@@ -87,7 +119,7 @@ def latexify_spacegroup(spacegroup_symbol):
         A latex formatted spacegroup with proper subscripts and overlines.
     """
     sym = re.sub(r"_(\d+)", r"$_{\1}$", spacegroup_symbol)
-    return re.sub(r"-(\d)", r"$\overline{\1}$", sym)
+    return re.sub(r"-(\d)", r"$\\overline{\1}$", sym)
 
 
 def stream_has_colours(stream):
@@ -105,6 +137,41 @@ def stream_has_colours(stream):
         return curses.tigetnum("colors") > 2
     except:
         return False  # guess false in case of error
+
+
+def transformation_to_string(matrix, translation_vec=(0, 0, 0), components=('x', 'y', 'z'), c='', delim=','):
+    """
+    Convenience method. Given matrix returns string, e.g. x+2y+1/4
+    :param matrix
+    :param translation_vec
+    :param components: either ('x', 'y', 'z') or ('a', 'b', 'c')
+    :param c: optional additional character to print (used for magmoms)
+    :param delim: delimiter
+    :return: xyz string
+    """
+    parts = []
+    for i in range(3):
+        s = ''
+        m = matrix[i]
+        t = translation_vec[i]
+        for j, dim in enumerate(components):
+            if m[j] != 0:
+                f = Fraction(m[j]).limit_denominator()
+                if s != '' and f >= 0:
+                    s += '+'
+                if abs(f.numerator) != 1:
+                    s += str(f.numerator)
+                elif f < 0:
+                    s += '-'
+                s += c + dim
+                if f.denominator != 1:
+                    s += '/' + str(f.denominator)
+        if t != 0:
+            s += ('+' if (t > 0 and s != '') else '') + str(Fraction(t).limit_denominator())
+        if s == '':
+            s += '0'
+        parts.append(s)
+    return delim.join(parts)
 
 
 class StringColorizer(object):

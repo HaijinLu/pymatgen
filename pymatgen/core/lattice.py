@@ -5,7 +5,6 @@
 from __future__ import division, unicode_literals
 import math
 import itertools
-import warnings
 
 from six.moves import map, zip
 
@@ -14,8 +13,7 @@ from numpy.linalg import inv
 from numpy import pi, dot, transpose, radians
 
 from monty.json import MSONable
-from monty.dev import deprecated
-from pymatgen.util.coord_utils import pbc_shortest_vectors
+from pymatgen.util.coord import pbc_shortest_vectors
 from pymatgen.util.num import abs_cap
 
 """
@@ -156,6 +154,22 @@ class Lattice(MSONable):
         """
         return dot(cart_coords, self.inv_matrix)
 
+    def d_hkl(self, miller_index):
+        """
+        Returns the distance between the hkl plane and the origin
+
+        Args:
+            miller_index ([h,k,l]): Miller index of plane
+
+        Returns:
+            d_hkl (float)
+        """
+
+        g = 0
+        for i, gi in enumerate(self.reciprocal_lattice.matrix):
+            g += (gi / (2 * np.pi)) * miller_index[i]
+        return 1 / (np.dot(g, g) ** (1 / 2))
+
     @staticmethod
     def cubic(a):
         """
@@ -260,7 +274,7 @@ class Lattice(MSONable):
                                        ang[0], ang[1], ang[2])
 
     @staticmethod
-    def from_parameters(a, b, c, alpha, beta, gamma):
+    def from_parameters(a, b, c, alpha, beta, gamma, vesta=False):
         """
         Create a Lattice using unit cell lengths and angles (in degrees).
 
@@ -271,6 +285,7 @@ class Lattice(MSONable):
             alpha (float): *alpha* angle in degrees.
             beta (float): *beta* angle in degrees.
             gamma (float): *gamma* angle in degrees.
+            vesta: True if you import Cartesian coordinates from VESTA.
 
         Returns:
             Lattice with the specified lattice parameters.
@@ -279,16 +294,33 @@ class Lattice(MSONable):
         alpha_r = radians(alpha)
         beta_r = radians(beta)
         gamma_r = radians(gamma)
-        val = (np.cos(alpha_r) * np.cos(beta_r) - np.cos(gamma_r))\
-            / (np.sin(alpha_r) * np.sin(beta_r))
-        # Sometimes rounding errors result in values slightly > 1.
-        val = abs_cap(val)
-        gamma_star = np.arccos(val)
-        vector_a = [a * np.sin(beta_r), 0.0, a * np.cos(beta_r)]
-        vector_b = [-b * np.sin(alpha_r) * np.cos(gamma_star),
-                    b * np.sin(alpha_r) * np.sin(gamma_star),
-                    b * np.cos(alpha_r)]
-        vector_c = [0.0, 0.0, float(c)]
+
+        if vesta:
+            cos_alpha = np.cos(alpha_r)
+            cos_beta = np.cos(beta_r)
+            cos_gamma = np.cos(gamma_r)
+            sin_gamma = np.sin(gamma_r)
+
+            c1 = c*cos_beta
+            c2 = (c*(cos_alpha - (cos_beta * cos_gamma))) / sin_gamma
+
+            vector_a = [float(a), 0.0, 0.0]
+            vector_b = [b * cos_gamma, b * sin_gamma,  0]
+            vector_c = [c1,  c2,  math.sqrt(c**2 - c1**2 - c2**2)]
+
+        else:
+            val = (np.cos(alpha_r) * np.cos(beta_r) - np.cos(gamma_r))\
+                / (np.sin(alpha_r) * np.sin(beta_r))
+            # Sometimes rounding errors result in values slightly > 1.
+            val = abs_cap(val)
+            gamma_star = np.arccos(val)
+
+            vector_a = [a * np.sin(beta_r), 0.0, a * np.cos(beta_r)]
+            vector_b = [-b * np.sin(alpha_r) * np.cos(gamma_star),
+                        b * np.sin(alpha_r) * np.sin(gamma_star),
+                        b * np.cos(alpha_r)]
+            vector_c = [0.0, 0.0, float(c)]
+
         return Lattice([vector_a, vector_b, vector_c])
 
     @classmethod
@@ -296,7 +328,7 @@ class Lattice(MSONable):
         """
         Create a Lattice from a dictionary containing the a, b, c, alpha, beta,
         and gamma parameters if fmt is None.
-        
+
         If fmt == "abivars", the function build a `Lattice` object from a
         dictionary with the Abinit variables `acell` and `rprim` in Bohr.
         If acell is not given, the Abinit default is used i.e. [1,1,1] Bohr
@@ -1038,40 +1070,6 @@ class Lattice(MSONable):
                 and abs(lengths[right_angles[0]] -
                         lengths[right_angles[1]]) < hex_length_tol)
 
-    @deprecated(get_points_in_sphere)
-    def get_all_distance_and_image(self, frac_coords1, frac_coords2):
-        """
-        Gets distance between two frac_coords and nearest periodic images.
-
-        Args:
-            frac_coords1 (3x1 array): Reference fcoords to get distance from.
-            frac_coords2 (3x1 array): fcoords to get distance from.
-
-        Returns:
-            [(distance, jimage)] List of distance and periodic lattice
-            translations of the other site for which the distance applies.
-            This means that the distance between frac_coords1 and (jimage +
-            frac_coords2) is equal to distance.
-        """
-        # The following code is heavily vectorized to maximize speed.
-        # Get the image adjustment necessary to bring coords to unit_cell.
-        adj1 = np.floor(frac_coords1)
-        adj2 = np.floor(frac_coords2)
-        # Shift coords to unitcell
-        coord1 = frac_coords1 - adj1
-        coord2 = frac_coords2 - adj2
-
-        n = self._get_mic_range(coord1, coord2)
-        ranges = [list(range(-i, i + 1)) for i in n]
-        images = np.array(list(itertools.product(*ranges)))
-
-        # Create tiled cartesian coords for computing distances.
-        vec = np.tile(coord2 - coord1, (len(images), 1)) + images
-        vec = self.get_cartesian_coords(vec)
-        # Compute distances manually.
-        dist = np.sqrt(np.sum(vec ** 2, 1)).tolist()
-        return list(zip(dist, adj1 - adj2 + images))
-
     def get_distance_and_image(self, frac_coords1, frac_coords2, jimage=None):
         """
         Gets distance between two frac_coords assuming periodic boundary
@@ -1100,42 +1098,10 @@ class Lattice(MSONable):
             v, d2 = pbc_shortest_vectors(self, frac_coords1, frac_coords2,
                                          return_d2=True)
             fc = self.get_fractional_coords(v[0][0]) + frac_coords1 - \
-                 frac_coords2
+                frac_coords2
             fc = np.array(np.round(fc), dtype=np.int)
-            return (np.sqrt(d2[0, 0]), fc)
+            return np.sqrt(d2[0, 0]), fc
 
         mapped_vec = self.get_cartesian_coords(jimage + frac_coords2
                                                - frac_coords1)
         return np.linalg.norm(mapped_vec), jimage
-
-    @deprecated(get_points_in_sphere)
-    def _get_mic_range(self, fcoords1, fcoords2):
-
-        if self.is_orthogonal:
-            return 1, 1, 1
-
-        if self._diags is None:
-            self._diags = np.sqrt((np.dot([[1, 1, 1], [-1, 1, 1], [1, -1, 1],
-                                     [-1, -1, 1],
-                                     ], self._matrix) ** 2).sum(1))
-
-        vecs = np.vstack(fcoords1[:, None] - fcoords2[None, :])
-        vecs = vecs - np.round(vecs)
-
-        d = dot(vecs, self._matrix)
-        d = np.sqrt(np.sum(d ** 2, axis=1))
-        d = np.max(d)
-
-        cutoff = min(d, max(self._diags) / 2)
-        n = np.array(np.ceil(cutoff * np.prod(self._lengths) /
-                             (self.volume * self._lengths)))
-
-        if any(n > 50):
-            n_new = np.minimum(n, 50)
-            warnings.warn("Cell is highly skewed and requires a search "
-                          "through image range of +- %s. For efficiency, "
-                          "we will limit the search to %s images. Recommend "
-                          "you do a niggli or LLL reduction of the cell "
-                          "before computing distances" % (n, n_new))
-            n = n_new.astype(dtype=np.int)
-        return n.astype(dtype=int)

@@ -12,11 +12,6 @@ from monty.json import MontyDecoder
 from pymatgen.analysis.defects.dilute_solution_model import *
 import random
 
-try:
-    import sympy
-except ImportError:
-    sympy = None
-
 test_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..",
                         'test_files')
 with open(
@@ -28,12 +23,14 @@ with open(os.path.join(test_dir, 'mp1487_raw_defect_energies.json')) as fp:
     mp1487_raw_energy_dict = json.load(fp, cls=MontyDecoder)
 
 
-# TODO (from SP): You MUST redo this entire test. The whole tset is
+PULL_REQ = os.environ.get("CI_PULL_REQUEST", None) or os.environ.get("TRAVIS", None)
+
+# TODO (from SP): You MUST redo this entire test. The whole test is
 # monstrously slow. It takes more than 10 mins to get through this test alone.
 
 
-@unittest.skipIf((not sympy) or random.randint(0, 10) % 10 != 0,
-                 "sympy not present or random skip.")
+@unittest.skipIf(PULL_REQ or random.randint(0, 10) % 10 != 0,
+                 "Pull request or random skip.")
 class DiluteSolutionModelTest(unittest.TestCase):
     def setUp(self):
         """
@@ -93,8 +90,8 @@ class DiluteSolutionModelTest(unittest.TestCase):
             # print(plot_data['y'])
 
 
-@unittest.skipIf((not sympy) or random.randint(0, 10) % 10 != 0,
-                 "sympy not present or random skip.")
+@unittest.skipIf(PULL_REQ or random.randint(0, 10) % 10 != 0,
+                 "Pull request or random skip.")
 class SoluteSiteFinderTest(unittest.TestCase):
     def setUp(self):
         """

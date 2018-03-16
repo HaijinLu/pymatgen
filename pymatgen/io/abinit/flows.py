@@ -20,7 +20,6 @@ import numpy as np
 
 from pprint import pprint
 from six.moves import map, StringIO
-from pymatgen.util.io_utils import AtomicFile
 from tabulate import tabulate
 from pydispatch import dispatcher
 from collections import OrderedDict
@@ -32,16 +31,17 @@ from monty.pprint import draw_tree
 from monty.termcolor import cprint, colored, cprint_map, get_terminal_size
 from monty.inspect import find_top_pyfile
 from monty.dev import deprecated
-from pymatgen.serializers.pickle_coders import pmg_pickle_load, pmg_pickle_dump
 from monty.json import MSONable
-from pymatgen.serializers.json_coders import pmg_serialize
+from pymatgen.util.serialization import pmg_pickle_load, pmg_pickle_dump, pmg_serialize
 from pymatgen.core.units import Memory
+from pymatgen.util.io_utils import AtomicFile
+from pymatgen.util.plotting import add_fig_kwargs, get_ax_fig_plt
 from . import wrappers
 from .nodes import Status, Node, NodeError, NodeResults, Dependency, GarbageCollector, check_spectator
 from .tasks import ScfTask, DdkTask, DdeTask, TaskManager, FixQueueCriticalError
 from .utils import File, Directory, Editor
 from .abiinspect import yaml_read_irred_perts
-from .works import NodeContainer, Work, BandStructureWork, PhononWork, BecWork, G0W0Work, QptdmWork
+from .works import NodeContainer, Work, BandStructureWork, PhononWork, BecWork, G0W0Work, QptdmWork, DteWork
 from .events import EventsParser # autodoc_event_handlers
 
 
@@ -118,7 +118,9 @@ class Flow(Node, NodeContainer, MSONable):
     Results = FlowResults
 
     @classmethod
-    def from_inputs(cls, workdir, inputs, manager=None, pickle_protocol=-1, task_class=ScfTask, work_class=Work):
+    def from_inputs(cls, workdir, inputs, manager=None, pickle_protocol=-1, task_class=ScfTask,
+                    work_class=Work, remove=False):
+
         """
         Construct a simple flow from a list of inputs. The flow contains a single Work with
         tasks whose class is given by task_class.
@@ -137,10 +139,11 @@ class Flow(Node, NodeContainer, MSONable):
                 -1 denotes the latest version supported by the python interpreter.
             task_class: The class of the :class:`Task`.
             work_class: The class of the :class:`Work`.
+            remove: attempt to remove working directory `workdir` if directory already exists.
         """
         if not isinstance(inputs, (list, tuple)): inputs = [inputs]
 
-        flow = cls(workdir, manager=manager, pickle_protocol=pickle_protocol)
+        flow = cls(workdir, manager=manager, pickle_protocol=pickle_protocol, remove=remove)
         work = work_class()
         for inp in inputs:
             work.register(inp, task_class=task_class)
@@ -261,6 +264,7 @@ class Flow(Node, NodeContainer, MSONable):
         self.indir = Directory(os.path.join(self.workdir, "indata"))
         self.outdir = Directory(os.path.join(self.workdir, "outdata"))
         self.tmpdir = Directory(os.path.join(self.workdir, "tmpdata"))
+        self.wdir = Directory(self.workdir)
 
     def reload(self):
         """
@@ -370,10 +374,15 @@ class Flow(Node, NodeContainer, MSONable):
         """The path of the pid file created by PyFlowScheduler."""
         return os.path.join(self.workdir, "_PyFlowScheduler.pid")
 
+    @property
+    def has_scheduler(self):
+        """True if there's a scheduler running the flow."""
+        return os.path.exists(self.pid_file)
+
     def check_pid_file(self):
         """
         This function checks if we are already running the :class:`Flow` with a :class:`PyFlowScheduler`.
-        Raises: Flow.Error if the pif file of the scheduler exists.
+        Raises: Flow.Error if the pid file of the scheduler exists.
         """
         if not os.path.exists(self.pid_file):
             return 0
@@ -685,20 +694,6 @@ class Flow(Node, NodeContainer, MSONable):
                         else:
                             yield task
 
-    @deprecated(message="show_inpvars will be removed in pymatgen 4.0. Use show_inputs")
-    def show_inpvars(self, *varnames):
-        from abipy.htc.variable import InputVariable
-        lines = []
-        app = lines.append
-
-        for task in self.iflat_tasks():
-            app(str(task))
-            for name in varnames:
-                value = task.input.get(name)
-                app(str(InputVariable(name, value)))
-
-        return "\n".join(lines)
-
     def abivalidate_inputs(self):
         """
         Run ABINIT in dry mode to validate all the inputs of the flow.
@@ -718,8 +713,7 @@ class Flow(Node, NodeContainer, MSONable):
             `RuntimeError` if executable is not in $PATH.
         """
         if not self.allocated:
-            self.build()
-            #self.build_and_pickle_dump()
+            self.allocate()
 
         isok, tuples = True, []
         for task in self.iflat_tasks():
@@ -855,7 +849,7 @@ class Flow(Node, NodeContainer, MSONable):
         app = lines.append
 
         app("Number of works: %d, total number of tasks: %s" % (len(self), self.num_tasks) )
-        app("Number of tasks with a given class:")
+        app("Number of tasks with a given class:\n")
 
         # Build Table
         data = [[cls.__name__, len(tasks)]
@@ -957,7 +951,10 @@ class Flow(Node, NodeContainer, MSONable):
 
                 qinfo = "None"
                 if task.queue_id is not None:
-                    qinfo = str(task.queue_id) + "@" + str(task.qname)
+                    qname = str(task.qname)
+                    if not verbose:
+                        qname = qname[:min(5, len(qname))]
+                    qinfo = str(task.queue_id) + "@" + qname
 
                 if task.status.is_critical:
                     tot_num_errors += 1
@@ -1116,7 +1113,7 @@ class Flow(Node, NodeContainer, MSONable):
                 nodes_files.append((node, File(filepath)))
 
         if nodes_files:
-            print("Found %s files with extension %s produced by the flow" % (len(nodes_files), ext), file=stream)
+            print("Found %s files with extension `%s` produced by the flow" % (len(nodes_files), ext), file=stream)
 
             table = [[f.relpath, "%.2f" % (f.get_stat().st_size / 1024**2),
                       node.node_id, node.__class__.__name__]
@@ -1126,13 +1123,14 @@ class Flow(Node, NodeContainer, MSONable):
         else:
             print("No output file with extension %s has been produced by the flow" % ext, file=stream)
 
-    def select_tasks(self, nids=None, wslice=None):
+    def select_tasks(self, nids=None, wslice=None, task_class=None):
         """
         Return a list with a subset of tasks.
 
         Args:
             nids: List of node identifiers.
             wslice: Slice object used to select works.
+            task_class: String or class used to select tasks. Ignored if None.
 
         .. note::
 
@@ -1151,7 +1149,74 @@ class Flow(Node, NodeContainer, MSONable):
             # All tasks selected if no option is provided.
             tasks = list(self.iflat_tasks())
 
+        # Filter by task class
+        if task_class is not None:
+            tasks = [t for t in tasks if t.isinstance(task_class)]
+
         return tasks
+
+    def get_task_scfcycles(self, nids=None, wslice=None, task_class=None, exclude_ok_tasks=False):
+        """
+        Return list of (taks, scfcycle) tuples for all the tasks in the flow with a SCF algorithm
+        e.g. electronic GS-SCF iteration, DFPT-SCF iterations etc.
+
+        Args:
+            nids: List of node identifiers.
+            wslice: Slice object used to select works.
+            task_class: String or class used to select tasks. Ignored if None.
+            exclude_ok_tasks: True if only running tasks should be considered.
+
+        Returns:
+            List of `ScfCycle` subclass instances.
+        """
+        select_status = [self.S_RUN] if exclude_ok_tasks else [self.S_RUN, self.S_OK]
+        tasks_cycles = []
+
+        for task in self.select_tasks(nids=nids, wslice=wslice):
+            # Fileter
+            if task.status not in select_status or task.cycle_class is None:
+                continue
+            if task_class is not None and not task.isinstance(task_class):
+                continue
+            try:
+                cycle = task.cycle_class.from_file(task.output_file.path)
+                if cycle is not None:
+                    tasks_cycles.append((task, cycle))
+            except Exception:
+                # This is intentionally ignored because from_file can fail for several reasons.
+                pass
+
+        return tasks_cycles
+
+    def show_tricky_tasks(self, verbose=0):
+        """
+        Print list of tricky tasks i.e. tasks that have been restarted or
+        launched more than once or tasks with corrections.
+
+        Args:
+            verbose: Verbosity level. If > 0, task history and corrections (if any) are printed.
+        """
+        nids, tasks = [], []
+        for task in self.iflat_tasks():
+            if task.num_launches > 1 or any(n > 0 for n in (task.num_restarts, task.num_corrections)):
+                nids.append(task.node_id)
+                tasks.append(task)
+
+        if not nids:
+            cprint("Everything's fine, no tricky tasks found", color="green")
+        else:
+            self.show_status(nids=nids)
+            if not verbose:
+                print("Use --verbose to print task history.")
+                return
+
+            for nid, task in zip(nids, tasks):
+                cprint(repr(task), **task.status.color_opts)
+                self.show_history(nids=[nid], full_history=False, metadata=False)
+                #if task.num_restarts:
+                #    self.show_restarts(nids=[nid])
+                if task.num_corrections:
+                    self.show_corrections(nids=[nid])
 
     def inspect(self, nids=None, wslice=None, **kwargs):
         """
@@ -1275,14 +1340,8 @@ class Flow(Node, NodeContainer, MSONable):
         """
         if not isinstance(nids, collections.Iterable): nids = [nids]
 
-        tasks = []
-        for nid in nids:
-            for task in self.iflat_tasks():
-                if task.node_id == nid:
-                    tasks.append(task)
-                    break
-
-        return tasks
+        n2task = {task.node_id: task for task in self.iflat_tasks()}
+        return [n2task[n] for n in nids if n in n2task]
 
     def wti_from_nids(self, nids):
         """Return the list of (w, t) indices from the list of node identifiers nids."""
@@ -1358,10 +1417,8 @@ class Flow(Node, NodeContainer, MSONable):
             if report is not None:
                 app("num_errors: %s, num_warnings: %s, num_comments: %s" % (
                     report.num_errors, report.num_warnings, report.num_comments))
-
                 app("*** ERRORS ***")
                 app("\n".join(str(e) for e in report.errors))
-
                 app("*** BUGS ***")
                 app("\n".join(str(b) for b in report.bugs))
 
@@ -1411,7 +1468,7 @@ class Flow(Node, NodeContainer, MSONable):
         sched_excfile = os.path.join(self.workdir, "_exceptions")
         if os.path.exists(sched_excfile):
             with open(sched_excfile, "r") as fh:
-                cprint("Found exceptions  raised by the scheduler", "red")
+                cprint("Found exceptions raised by the scheduler", "red")
                 cprint(fh.read(), color="red")
                 return
 
@@ -1502,7 +1559,7 @@ class Flow(Node, NodeContainer, MSONable):
             cprint("Found scheduler attached to this flow.", "yellow")
             cprint("Sending SIGKILL to the scheduler before cancelling the tasks!", "yellow")
 
-            with open(self.pid_file, "r") as fh:
+            with open(self.pid_file, "rt") as fh:
                 pid = int(fh.readline())
 
             retcode = os.system("kill -9 %d" % pid)
@@ -1558,13 +1615,16 @@ class Flow(Node, NodeContainer, MSONable):
                        "This means that you are trying to build a new flow in a directory already used by another flow.\n"
                        "Possible solutions:\n"
                        "   1) Change the workdir of the new flow.\n"
-                       "   2) remove the old directory either with `rm -rf` or by calling the method flow.rmtree()\n"
+                       "   2) remove the old directory either with `rm -r` or by calling the method flow.rmtree()\n"
                         % (node_id, nodeid_path, self.node_id))
                 raise RuntimeError(msg)
 
         else:
             with open(nodeid_path, "wt") as fh:
                 fh.write(str(self.node_id))
+
+        if self.pyfile and os.path.isfile(self.pyfile):
+            shutil.copy(self.pyfile, self.workdir)
 
         for work in self:
             work.build(*args, **kwargs)
@@ -1573,7 +1633,6 @@ class Flow(Node, NodeContainer, MSONable):
         """
         Build dirs and file of the `Flow` and save the object in pickle format.
         Returns 0 if success
-
 
         Args:
             abivalidate: If True, all the input files are validate by calling
@@ -1625,7 +1684,7 @@ class Flow(Node, NodeContainer, MSONable):
                         else protocol)
         return strio.getvalue()
 
-    def register_task(self, input, deps=None, manager=None, task_class=None):
+    def register_task(self, input, deps=None, manager=None, task_class=None, append=False):
         """
         Utility function that generates a `Work` made of a single task
 
@@ -1636,13 +1695,24 @@ class Flow(Node, NodeContainer, MSONable):
             manager: The :class:`TaskManager` responsible for the submission of the task.
                      If manager is None, we use the :class:`TaskManager` specified during the creation of the work.
             task_class: Task subclass to instantiate. Default: :class:`AbinitTask`
+            append: If true, the task is added to the last work (a new Work is created if flow is empty)
 
         Returns:
             The generated :class:`Work` for the task, work[0] is the actual task.
         """
-        work = Work(manager=manager)
+        # append True is much easier to use. In principle should be the default behaviour
+        # but this would break the previous API so ...
+        if not append:
+            work = Work(manager=manager)
+        else:
+            if not self.works:
+                work = Work(manager=manager)
+                append = False
+            else:
+                work = self.works[-1]
+
         task = work.register(input, deps=deps, task_class=task_class)
-        self.register_work(work)
+        if not append: self.register_work(work)
 
         return work
 
@@ -1727,7 +1797,7 @@ class Flow(Node, NodeContainer, MSONable):
         except AttributeError:
             return 0
 
-    def allocate(self, workdir=None):
+    def allocate(self, workdir=None, use_smartio=False):
         """
         Allocate the `Flow` i.e. assign the `workdir` and (optionally)
         the :class:`TaskManager` to the different tasks in the Flow.
@@ -1735,6 +1805,9 @@ class Flow(Node, NodeContainer, MSONable):
         Args:
             workdir: Working directory of the flow. Must be specified here
                 if we haven't initialized the workdir in the __init__.
+
+        Return:
+            self
         """
         if workdir is not None:
             # We set the workdir of the flow here
@@ -1758,6 +1831,9 @@ class Flow(Node, NodeContainer, MSONable):
         if not hasattr(self, "_allocated"): self._allocated = 0
         self._allocated += 1
 
+        if use_smartio:
+            self.use_smartio()
+
         return self
 
     def use_smartio(self):
@@ -1768,11 +1844,13 @@ class Flow(Node, NodeContainer, MSONable):
         Smart-io means that big files (e.g. WFK) are written only if the calculation
         is unconverged so that we can restart from it. No output is produced if
         convergence is achieved.
+
+        Return:
+            self
         """
         if not self.allocated:
+            #raise RuntimeError("You must call flow.allocate() before invoking flow.use_smartio()")
             self.allocate()
-            #raise RuntimeError("You must call flow.allocate before invoking flow.use_smartio")
-            return
 
         for task in self.iflat_tasks():
             children = task.get_children()
@@ -1801,6 +1879,8 @@ class Flow(Node, NodeContainer, MSONable):
                     if abiext not in must_produce_abiexts:
                         print("%s: setting %s to -1" % (task, varname))
                         task.set_vars({varname: -1})
+
+        return self
 
     #def new_from_input_decorators(self, new_workdir, decorators)
     #    """
@@ -1854,11 +1934,11 @@ class Flow(Node, NodeContainer, MSONable):
         Return 0 if success
         """
         if self.finalized:
-            self.history.warning("Calling finalize on an alrady finalized flow.")
+            self.history.warning("Calling finalize on an already finalized flow.")
             return 1
 
-        self.history.warning("Calling flow.finalize.")
-        self.finalized = False
+        self.history.info("Calling flow.finalize.")
+        self.finalized = True
 
         if self.has_db:
             self.history.info("Saving results in database.")
@@ -1982,19 +2062,25 @@ class Flow(Node, NodeContainer, MSONable):
 
     #def get_results(self, **kwargs)
 
-    def rapidfire(self, check_status=True, **kwargs):
+    def rapidfire(self, check_status=True, max_nlaunch=-1, max_loops=1, sleep_time=5, **kwargs):
         """
         Use :class:`PyLauncher` to submits tasks in rapidfire mode.
         kwargs contains the options passed to the launcher.
 
+        Args:
+            check_status:
+            max_nlaunch: Maximum number of launches. default: no limit.
+            max_loops: Maximum number of loops
+            sleep_time: seconds to sleep between rapidfire loop iterations
+
         Return:
-            number of tasks submitted.
+            Number of tasks submitted.
         """
         self.check_pid_file()
         self.set_spectator_mode(False)
         if check_status: self.check_status()
         from .launcher import PyLauncher
-        return PyLauncher(self, **kwargs).rapidfire()
+        return PyLauncher(self, **kwargs).rapidfire(max_nlaunch=max_nlaunch, max_loops=max_loops, sleep_time=sleep_time)
 
     def single_shot(self, check_status=True, **kwargs):
         """
@@ -2148,24 +2234,136 @@ class Flow(Node, NodeContainer, MSONable):
     #    if check_status: self.check_status()
     #    return abirobot(flow=self, ext=ext, nids=nids):
 
-    def plot_networkx(self, mode="network", with_edge_labels=False,
+    def get_graphviz(self, engine="automatic", graph_attr=None, node_attr=None, edge_attr=None):
+        """
+        Generate flow graph in the DOT language.
+
+        Args:
+            engine: Layout command used. ['dot', 'neato', 'twopi', 'circo', 'fdp', 'sfdp', 'patchwork', 'osage']
+            graph_attr: Mapping of (attribute, value) pairs for the graph.
+            node_attr: Mapping of (attribute, value) pairs set for all nodes.
+            edge_attr: Mapping of (attribute, value) pairs set for all edges.
+
+        Returns: graphviz.Digraph <https://graphviz.readthedocs.io/en/stable/api.html#digraph>
+        """
+        self.allocate()
+
+        from graphviz import Digraph
+        fg = Digraph("flow", #filename="flow_%s.gv" % os.path.basename(self.relworkdir),
+            engine="fdp" if engine == "automatic" else engine)
+
+        # Set graph attributes.
+        # https://www.graphviz.org/doc/info/
+        #fg.attr(label="%s@%s" % (self.__class__.__name__, self.relworkdir))
+        fg.attr(label=repr(self))
+        #fg.attr(fontcolor="white", bgcolor='purple:pink')
+        fg.attr(rankdir="LR", pagedir="BL")
+        #fg.attr(constraint="false", pack="true", packMode="clust")
+        fg.node_attr.update(color='lightblue2', style='filled')
+        #fg.node_attr.update(ranksep='equally')
+
+        # Add input attributes.
+        if graph_attr is not None:
+            fg.graph_attr.update(**graph_attr)
+        if node_attr is not None:
+            fg.node_attr.update(**node_attr)
+        if edge_attr is not None:
+            fg.edge_attr.update(**edge_attr)
+
+        def node_kwargs(node):
+            return dict(
+                #shape="circle",
+                color=node.color_hex,
+                fontsize="8.0",
+                label=(str(node) if not hasattr(node, "pos_str") else
+                    node.pos_str + "\n" + node.__class__.__name__),
+            )
+
+        edge_kwargs = dict(arrowType="vee", style="solid")
+        cluster_kwargs = dict(rankdir="LR", pagedir="BL", style="rounded", bgcolor="azure2")
+
+        for work in self:
+            # Build cluster with tasks.
+            cluster_name = "cluster%s" % work.name
+            with fg.subgraph(name=cluster_name) as wg:
+                wg.attr(**cluster_kwargs)
+                wg.attr(label="%s (%s)" % (work.__class__.__name__, work.name))
+                #wg.attr(label=repr(work))
+                #wg.attr(label="%s (%s)\n%s (%s)" % (
+                #    work.__class__.__name__, work.name, work.relworkdir, work.node_id))
+                for task in work:
+                    wg.node(task.name, **node_kwargs(task))
+                    # Connect children to task.
+                    for child in task.get_children():
+                        # Find file extensions required by this task
+                        i = [dep.node for dep in child.deps].index(task)
+                        edge_label = "+".join(child.deps[i].exts)
+                        fg.edge(task.name, child.name, label=edge_label, color=task.color_hex,
+                                **edge_kwargs)
+
+        # Treat the case in which we have a work producing output for other tasks.
+        for work in self:
+            children = work.get_children()
+            if not children: continue
+            cluster_name = "cluster%s" % work.name
+            seen = set()
+            for child in children:
+                # This is not needed, too much confusing
+                #fg.edge(cluster_name, child.name, color=work.color_hex, **edge_kwargs)
+                # Find file extensions required by work
+                i = [dep.node for dep in child.deps].index(work)
+                for ext in child.deps[i].exts:
+                    out = "%s (%s)" % (ext, work.name)
+                    fg.node(out)
+                    fg.edge(out, child.name, **edge_kwargs)
+                    key = (cluster_name, out)
+                    if key not in seen:
+                        seen.add(key)
+                        fg.edge(cluster_name, out, color=work.color_hex, **edge_kwargs)
+
+        # Treat the case in which we have a task that depends on external files.
+        seen = set()
+        for task in self.iflat_tasks():
+            #print(task.get_parents())
+            for node in (p for p in task.get_parents() if p.is_file):
+                #print("parent file node", node)
+                #infile = "%s (%s)" % (ext, work.name)
+                infile = node.filepath
+                if infile not in seen:
+                    seen.add(infile)
+                    fg.node(infile, **node_kwargs(node))
+
+                fg.edge(infile, task.name, color=node.color_hex, **edge_kwargs)
+
+        return fg
+
+    @add_fig_kwargs
+    def plot_networkx(self, mode="network", with_edge_labels=False, ax=None, arrows=False,
                       node_size="num_cores", node_label="name_class", layout_type="spring", **kwargs):
         """
         Use networkx to draw the flow with the connections among the nodes and
         the status of the tasks.
 
+        Args:
+            mode: `networkx` to show connections, `status` to group tasks by status.
+            with_edge_labels: True to draw edge labels.
+            ax: matplotlib :class:`Axes` or None if a new figure should be created.
+            arrows: if True draw arrowheads.
+            node_size: By default, the size of the node is proportional to the number of cores used.
+            node_label: By default, the task class is used to label node.
+            layout_type: Get positions for all nodes using `layout_type`. e.g. pos = nx.spring_layout(g)
+
         .. warning::
 
             Requires networkx package.
         """
-        if not self.allocated: self.allocate()
-
-        import networkx as nx
+        self.allocate()
 
         # Build the graph
-        g, edge_labels = nx.Graph(), {}
-        tasks = list(self.iflat_tasks())
-        for task in tasks:
+        import networkx as nx
+        g = nx.Graph() if not arrows else nx.DiGraph()
+        edge_labels = {}
+        for task in self.iflat_tasks():
             g.add_node(task, name=task.name)
             for child in task.get_children():
                 g.add_edge(task, child)
@@ -2173,33 +2371,66 @@ class Flow(Node, NodeContainer, MSONable):
                 i = [dep.node for dep in child.deps].index(task)
                 edge_labels[(task, child)] = " ".join(child.deps[i].exts)
 
+            filedeps = [d for d in task.deps if d.node.is_file]
+            for d in filedeps:
+                #print(d.node, d.exts)
+                g.add_node(d.node, name="%s (%s)" % (d.node.basename, d.node.node_id))
+                g.add_edge(d.node, task)
+                edge_labels[(d.node, task)] = "+".join(d.exts)
+
+        # This part is needed if we have a work that produces output used by other nodes.
+        for work in self:
+            children = work.get_children()
+            if not children:
+                continue
+            g.add_node(work, name=work.name)
+            for task in work:
+                g.add_edge(task, work)
+                edge_labels[(task, work)] = "all_ok "
+            for child in children:
+                #print(child)
+                g.add_edge(work, child)
+                i = [dep.node for dep in child.deps].index(work)
+                edge_labels[(work, child)] = "+".join(child.deps[i].exts)
+
         # Get positions for all nodes using layout_type.
         # e.g. pos = nx.spring_layout(g)
         pos = getattr(nx, layout_type + "_layout")(g)
 
         # Select function used to compute the size of the node
-        make_node_size = dict(num_cores=lambda task: 300 * task.manager.num_cores)[node_size]
+        def make_node_size(node):
+            if node.is_task:
+                return 300 * node.manager.num_cores
+            else:
+                return 600
 
-        # Select function used to build the label
-        make_node_label = dict(name_class=lambda task: task.pos_str + "\n" + task.__class__.__name__,)[node_label]
+        # Function used to build the label
+        def make_node_label(node):
+            if node_label == "name_class":
+                if node.is_file:
+                    return "%s\n(%s)" % (node.basename, node.node_id)
+                else:
+                    return (node.pos_str + "\n" + node.__class__.__name__
+                            if hasattr(node, "pos_str") else str(node))
+            else:
+                raise NotImplementedError("node_label: %s" % str(node_label))
 
-        labels = {task: make_node_label(task) for task in g.nodes()}
-
-        import matplotlib.pyplot as plt
+        labels = {node: make_node_label(node) for node in g.nodes()}
+        ax, fig, plt = get_ax_fig_plt(ax=ax)
 
         # Select plot type.
         if mode == "network":
             nx.draw_networkx(g, pos, labels=labels,
-                             node_color=[task.color_rgb for task in g.nodes()],
-                             node_size=[make_node_size(task) for task in g.nodes()],
-                             width=1, style="dotted", with_labels=True)
+                             node_color=[node.color_rgb for node in g.nodes()],
+                             node_size=[make_node_size(node) for node in g.nodes()],
+                             width=1, style="dotted", with_labels=True, arrows=arrows, ax=ax)
 
             # Draw edge labels
             if with_edge_labels:
-                nx.draw_networkx_edge_labels(g, pos, edge_labels=edge_labels)
+                nx.draw_networkx_edge_labels(g, pos, edge_labels=edge_labels, ax=ax)
 
         elif mode == "status":
-            # Group tasks by status.
+            # Group tasks by status (only tasks are show here).
             for status in self.ALL_STATUS:
                 tasks = list(self.iflat_tasks(status=status))
 
@@ -2212,27 +2443,26 @@ class Flow(Node, NodeContainer, MSONable):
                                        nodelist=tasks,
                                        node_color=node_color,
                                        node_size=[make_node_size(task) for task in tasks],
-                                       alpha=0.5,
+                                       alpha=0.5, ax=ax
                                        #label=str(status),
                                        )
-
             # Draw edges.
-            nx.draw_networkx_edges(g, pos, width=2.0, alpha=0.5, arrows=True) # edge_color='r')
+            nx.draw_networkx_edges(g, pos, width=2.0, alpha=0.5, arrows=arrows, ax=ax) # edge_color='r')
 
             # Draw labels
-            nx.draw_networkx_labels(g, pos, labels, font_size=12)
+            nx.draw_networkx_labels(g, pos, labels, font_size=12, ax=ax)
 
             # Draw edge labels
             if with_edge_labels:
-                nx.draw_networkx_edge_labels(g, pos, edge_labels=edge_labels)
+                nx.draw_networkx_edge_labels(g, pos, edge_labels=edge_labels, ax=ax)
                 #label_pos=0.5, font_size=10, font_color='k', font_family='sans-serif', font_weight='normal',
                 # alpha=1.0, bbox=None, ax=None, rotate=True, **kwds)
 
         else:
-            raise ValueError("Unknown value for mode: %s" % mode)
+            raise ValueError("Unknown value for mode: %s" % str(mode))
 
-        plt.axis('off')
-        plt.show()
+        ax.axis("off")
+        return fig
 
 
 class G0W0WithQptdmFlow(Flow):
@@ -2478,16 +2708,90 @@ class PhononFlow(Flow):
             raise ValueError("ph_ngqpt %s should be a sub-mesh of scf_ngkpt %s" % (ph_ngqpt, scf_ngkpt))
 
         # Get the q-points in the IBZ from Abinit
-        qpoints = scf_input.abiget_ibz(ngkpt=ph_ngqpt, shiftk=(0,0,0), kptopt=1).points
+        qpoints = scf_input.abiget_ibz(ngkpt=ph_ngqpt, shiftk=(0, 0, 0), kptopt=1).points
 
         # Create a PhononWork for each q-point. Add DDK and E-field if q == Gamma and with_becs.
         for qpt in qpoints:
             if np.allclose(qpt, 0) and with_becs:
                 ph_work = BecWork.from_scf_task(scf_task)
             else:
-                ph_work = PhononWork.from_scf_task(scf_task, qpt=qpt)
+                ph_work = PhononWork.from_scf_task(scf_task, qpoints=qpt)
 
             flow.register_work(ph_work)
+
+        if allocate: flow.allocate()
+
+        return flow
+
+    def open_final_ddb(self):
+        """
+        Open the DDB file located in the output directory of the flow.
+
+        Return:
+            :class:`DdbFile` object, None if file could not be found or file is not readable.
+        """
+        ddb_path = self.outdir.has_abiext("DDB")
+        if not ddb_path:
+            if self.status == self.S_OK:
+                logger.critical("%s reached S_OK but didn't produce a GSR file in %s" % (self, self.outdir))
+            return None
+
+        from abipy.dfpt.ddb import DdbFile
+        try:
+            return DdbFile(ddb_path)
+        except Exception as exc:
+            logger.critical("Exception while reading DDB file at %s:\n%s" % (ddb_path, str(exc)))
+            return None
+
+    def finalize(self):
+        """This method is called when the flow is completed."""
+        # Merge all the out_DDB files found in work.outdir.
+        ddb_files = list(filter(None, [work.outdir.has_abiext("DDB") for work in self]))
+
+        # Final DDB file will be produced in the outdir of the work.
+        out_ddb = self.outdir.path_in("out_DDB")
+        desc = "DDB file merged by %s on %s" % (self.__class__.__name__, time.asctime())
+
+        mrgddb = wrappers.Mrgddb(manager=self.manager, verbose=0)
+        mrgddb.merge(self.outdir.path, ddb_files, out_ddb=out_ddb, description=desc)
+        print("Final DDB file available at %s" % out_ddb)
+
+        # Call the method of the super class.
+        retcode = super(PhononFlow, self).finalize()
+        return retcode
+
+
+class NonLinearCoeffFlow(Flow):
+    """
+    1) One workflow for the GS run.
+
+    2) nqpt works for electric field calculations. Each work contains
+       nirred tasks where nirred is the number of irreducible perturbations
+       for that particular q-point.
+    """
+    @classmethod
+    def from_scf_input(cls, workdir, scf_input, manager=None, allocate=True):
+        """
+        Create a `NonlinearFlow` for second order susceptibility calculations from
+        an `AbinitInput` defining a ground-state run.
+
+        Args:
+            workdir: Working directory of the flow.
+            scf_input: :class:`AbinitInput` object with the parameters for the GS-SCF run.
+            manager: :class:`TaskManager` object. Read from `manager.yml` if None.
+            allocate: True if the flow should be allocated before returning.
+
+        Return:
+            :class:`NonlinearFlow` object.
+        """
+        flow = cls(workdir, manager=manager)
+
+        flow.register_scf_task(scf_input)
+        scf_task = flow[0][0]
+
+        nl_work = DteWork.from_scf_task(scf_task)
+
+        flow.register_work(nl_work)
 
         if allocate: flow.allocate()
 
@@ -2528,7 +2832,7 @@ class PhononFlow(Flow):
         print("Final DDB file available at %s" % out_ddb)
 
         # Call the method of the super class.
-        retcode = super(PhononFlow, self).finalize()
+        retcode = super(NonLinearCoeffFlow, self).finalize()
         print("retcode", retcode)
         #if retcode != 0: return retcode
         return retcode
@@ -2702,7 +3006,7 @@ def phonon_conv_flow(workdir, scf_input, qpoints, params, manager=None, allocate
             work = flow.register_scf_task(gs_inp)
 
             # Add the PhononWork connected to this scf_task.
-            flow.register_work(PhononWork.from_scf_task(work[0], qpt=qpt))
+            flow.register_work(PhononWork.from_scf_task(work[0], qpoints=qpt))
 
     if allocate: flow.allocate()
     return flow

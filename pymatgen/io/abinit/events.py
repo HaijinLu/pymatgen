@@ -11,11 +11,10 @@ import sys
 import os.path
 import datetime
 import collections
-import yaml
+import ruamel.yaml as yaml
 import six
 import abc
 import logging
-import inspect
 import numpy as np
 
 from monty.string import indent, is_string, list_strings
@@ -25,13 +24,20 @@ from monty.inspect import all_subclasses
 from monty.json import MontyDecoder
 from pymatgen.core.structure import Structure
 from monty.json import MSONable
-from pymatgen.serializers.json_coders import pmg_serialize
+from pymatgen.util.serialization import pmg_serialize
 from .abiinspect import YamlTokenizer
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "EventsParser",
+    "get_event_handler_classes",
+    "ScfConvergenceWarning",
+    "NscfConvergenceWarning",
+    "RelaxConvergenceWarning",
+    "Correction",
+    "DilatmxError",
+    "DilatmxErrorHandler",
 ]
 
 
@@ -73,7 +79,7 @@ class AbinitEvent(yaml.YAMLObject):
     1) We use YamlTokenizer to extract the documents from the output file
     2) If we have a tag that ends with "Warning", "Error", "Bug", "Comment
        we know we have encountered a new ABINIT event
-    3) We parse the document with yaml.load(doc.text) and we get the object
+    3) We parse the document with yaml.safe_load(doc.text) and we get the object
 
     Note that:
         # --- and ... become reserved words (whey they are placed at
@@ -81,7 +87,7 @@ class AbinitEvent(yaml.YAMLObject):
           the end of YAML documents.
 
         # All the possible events should subclass `AbinitEvent` and define
-          the class attribute yaml_tag so that yaml.load will know how to
+          the class attribute yaml_tag so that yaml.safe_load will know how to
           build the instance.
     """
     color = None
@@ -418,14 +424,16 @@ class EventsParser(object):
         report = EventReport(filename)
 
         w = WildCard("*Error|*Warning|*Comment|*Bug|*ERROR|*WARNING|*COMMENT|*BUG")
-
+        import warnings
+        warnings.simplefilter('ignore', yaml.error.UnsafeLoaderWarning)
         with YamlTokenizer(filename) as tokens:
             for doc in tokens:
                 if w.match(doc.tag):
                     #print("got doc.tag", doc.tag,"--")
                     try:
                         #print(doc.text)
-                        event = yaml.load(doc.text)
+                        event = yaml.load(doc.text)   # Can't use ruamel safe_load!
+                        #yaml.load(doc.text, Loader=ruamel.yaml.Loader)
                         #print(event.yaml_tag, type(event))
                     except:
                         #raise
@@ -438,7 +446,7 @@ class EventsParser(object):
                             message += "Traceback:\n %s" % straceback()
 
                         if "error" in doc.tag.lower():
-                            print("It seems an error", doc.tag)
+                            print("It seems an error. doc.tag:", doc.tag)
                             event = AbinitYamlError(message=message, src_file=__file__, src_line=0)
                         else:
                             event = AbinitYamlWarning(message=message, src_file=__file__, src_line=0)
@@ -559,18 +567,20 @@ class EventHandler(six.with_metaclass(abc.ABCMeta, MSONable, object)):
 
     @pmg_serialize
     def as_dict(self):
-        #@Guido this introspection is nice but it's not safe
+        """
+        Basic implementation of as_dict if __init__ has no arguments. Subclasses may need to overwrite.
+        """
+
         d = {}
-        if hasattr(self, "__init__"):
-            for c in inspect.getargspec(self.__init__).args:
-                if c != "self":
-                    d[c] = self.__getattribute__(c)
         return d
 
     @classmethod
     def from_dict(cls, d):
-        kwargs = {k: v for k, v in d.items() if k in inspect.getargspec(cls.__init__).args}
-        return cls(**kwargs)
+        """
+        Basic implementation of from_dict if __init__ has no arguments. Subclasses may need to overwrite.
+        """
+
+        return cls()
 
     @classmethod
     def compare_inputs(cls, new_input, old_input):
@@ -713,6 +723,14 @@ class DilatmxErrorHandler(ErrorHandler):
     def __init__(self, max_dilatmx=1.3):
         self.max_dilatmx = max_dilatmx
 
+    @pmg_serialize
+    def as_dict(self):
+        return {'max_dilatmx': self.max_dilatmx}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(max_dilatmx=d['max_dilatmx'])
+
     def handle_task_event(self, task, event):
         # Read the last structure dumped by ABINIT before aborting.
         filepath = task.outdir.has_abiext("DILATMX_STRUCT.nc")
@@ -768,6 +786,14 @@ class TolSymErrorHandler(ErrorHandler):
 
     def __init__(self, max_nfixes=3):
         self.max_nfixes = max_nfixes
+
+    @pmg_serialize
+    def as_dict(self):
+        return {'max_nfixes': self.max_nfixes}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(max_nfixes=d['max_nfixes'])
 
     def handle_task_event(self, task, event):
         # TODO: Add limit on the number of fixes one can do for the same error

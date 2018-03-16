@@ -2,7 +2,7 @@
 # Copyright (c) Pymatgen Development Team.
 # Distributed under the terms of the MIT License.
 """
-Works for Abinit:
+Works for Abinit
 """
 from __future__ import unicode_literals, division, print_function
 
@@ -20,14 +20,14 @@ from monty.collections import AttrDict
 from monty.itertools import chunks
 from monty.functools import lazy_property
 from monty.fnmatch import WildCard
-from monty.dev import deprecated
+#from monty.dev import deprecated
 from pydispatch import dispatcher
 from pymatgen.core.units import EnergyArray
 from . import wrappers
 from .nodes import Dependency, Node, NodeError, NodeResults, check_spectator
 from .tasks import (Task, AbinitTask, ScfTask, NscfTask, DfptTask, PhononTask, DdkTask,
                     BseTask, RelaxTask, DdeTask, BecTask, ScrTask, SigmaTask,
-                    EphTask, CollinearThenNonCollinearScfTask)
+                    DteTask, EphTask, CollinearThenNonCollinearScfTask)
 
 from .utils import Directory
 from .netcdf import ETSF_Reader, NetcdfReader
@@ -80,7 +80,8 @@ class BaseWork(six.with_metaclass(abc.ABCMeta, Node)):
     Results = WorkResults
 
     # interface modeled after subprocess.Popen
-    @abc.abstractproperty
+    @property
+    @abc.abstractmethod
     def processes(self):
         """Return a list of objects that support the `subprocess.Popen` protocol."""
 
@@ -255,6 +256,104 @@ class BaseWork(six.with_metaclass(abc.ABCMeta, Node)):
         results = self.Results.from_node(self)
         return results
 
+    def get_graphviz(self, engine="automatic", graph_attr=None, node_attr=None, edge_attr=None):
+        """
+        Generate task graph in the DOT language (only parents and children of this work).
+
+        Args:
+            engine: Layout command used. ['dot', 'neato', 'twopi', 'circo', 'fdp', 'sfdp', 'patchwork', 'osage']
+            graph_attr: Mapping of (attribute, value) pairs for the graph.
+            node_attr: Mapping of (attribute, value) pairs set for all nodes.
+            edge_attr: Mapping of (attribute, value) pairs set for all edges.
+
+        Returns: graphviz.Digraph <https://graphviz.readthedocs.io/en/stable/api.html#digraph>
+        """
+        from graphviz import Digraph
+        fg = Digraph("work", #filename="work_%s.gv" % os.path.basename(self.workdir),
+            engine="fdp" if engine == "automatic" else engine)
+
+        # Set graph attributes.
+        # https://www.graphviz.org/doc/info/
+        #fg.attr(label="%s@%s" % (self.__class__.__name__, self.relworkdir))
+        fg.attr(label=repr(self))
+        #fg.attr(fontcolor="white", bgcolor='purple:pink')
+        fg.attr(rankdir="LR", pagedir="BL")
+        #fg.attr(constraint="false", pack="true", packMode="clust")
+        fg.node_attr.update(color='lightblue2', style='filled')
+        #fg.node_attr.update(ranksep='equally')
+
+        # Add input attributes.
+        if graph_attr is not None:
+            fg.graph_attr.update(**graph_attr)
+        if node_attr is not None:
+            fg.node_attr.update(**node_attr)
+        if edge_attr is not None:
+            fg.edge_attr.update(**edge_attr)
+
+        def node_kwargs(node):
+            return dict(
+                #shape="circle",
+                color=node.color_hex,
+                label=(str(node) if not hasattr(node, "pos_str") else
+                    node.pos_str + "\n" + node.__class__.__name__),
+            )
+
+        edge_kwargs = dict(arrowType="vee", style="solid")
+        cluster_kwargs = dict(rankdir="LR", pagedir="BL", style="rounded", bgcolor="azure2")
+
+        # Build cluster with tasks in *this* work
+        cluster_name = "cluster%s" % self.name
+        with fg.subgraph(name=cluster_name) as wg:
+            wg.attr(**cluster_kwargs)
+            wg.attr(label="%s (%s)" % (self.__class__.__name__, self.name))
+            for task in self:
+                wg.node(task.name, **node_kwargs(task))
+                # Connect task to children
+                for child in task.get_children():
+                    # Test if child is in this cluster (self).
+                    myg = wg if child in self else fg
+                    myg.node(child.name, **node_kwargs(child))
+                    # Find file extensions required by this task
+                    i = [dep.node for dep in child.deps].index(task)
+                    edge_label = "+".join(child.deps[i].exts)
+                    myg.edge(task.name, child.name, label=edge_label, color=task.color_hex,
+                             **edge_kwargs)
+
+                # Connect task to parents
+                for parent in task.get_parents():
+                    # Test if parent is in this cluster (self).
+                    myg = wg if parent in self else fg
+                    myg.node(parent.name, **node_kwargs(parent))
+                    # Find file extensions required by this task
+                    i = [dep.node for dep in task.deps].index(parent)
+                    edge_label = "+".join(task.deps[i].exts)
+                    myg.edge(parent.name, task.name, label=edge_label, color=parent.color_hex,
+                             **edge_kwargs)
+
+        # Treat the case in which we have a work producing output for tasks in *this* work.
+        #for work in self.flow:
+        #    children = work.get_children()
+        #    if not children or all(child not in self for child in children):
+        #        continue
+        #    cluster_name = "cluster%s" % work.name
+        #    seen = set()
+        #    for child in children:
+        #        if child not in self: continue
+        #        # This is not needed, too much confusing
+        #        #fg.edge(cluster_name, child.name, color=work.color_hex, **edge_kwargs)
+        #        # Find file extensions required by work
+        #        i = [dep.node for dep in child.deps].index(work)
+        #        for ext in child.deps[i].exts:
+        #            out = "%s (%s)" % (ext, work.name)
+        #            fg.node(out)
+        #            fg.edge(out, child.name, **edge_kwargs)
+        #            key = (cluster_name, out)
+        #            if key not in seen:
+        #                fg.edge(cluster_name, out, color=work.color_hex, **edge_kwargs)
+        #                seen.add(key)
+
+        return fg
+
 
 class NodeContainer(six.with_metaclass(abc.ABCMeta)):
     """
@@ -316,6 +415,11 @@ class NodeContainer(six.with_metaclass(abc.ABCMeta)):
     def register_dde_task(self, *args, **kwargs):
         """Register a Dde task."""
         kwargs["task_class"] = DdeTask
+        return self.register_task(*args, **kwargs)
+
+    def register_dte_task(self, *args, **kwargs):
+        """Register a Dte task."""
+        kwargs["task_class"] = DteTask
         return self.register_task(*args, **kwargs)
 
     def register_bec_task(self, *args, **kwargs):
@@ -429,6 +533,7 @@ class Work(BaseWork, NodeContainer):
         self.indir = Directory(os.path.join(self.workdir, "indata"))
         self.outdir = Directory(os.path.join(self.workdir, "outdata"))
         self.tmpdir = Directory(os.path.join(self.workdir, "tmpdata"))
+        self.wdir = Directory(self.workdir)
 
     def chroot(self, new_workdir):
         self.set_workdir(new_workdir, chroot=True)
@@ -510,8 +615,15 @@ class Work(BaseWork, NodeContainer):
 
             if not hasattr(task, "manager"):
                 # Set the manager
-                # Use the one provided in input else the one of the work.
-                task.set_manager(manager) if manager is not None else task.set_manager(self.manager)
+                # Use the one provided in input else the one of the work/flow.
+                if manager is not None:
+                    task.set_manager(manager)
+                else:
+                    # Look first in work and then in the flow.
+                    if hasattr(self, "manager"):
+                        task.set_manager(self.manager)
+                    else:
+                        task.set_manager(self.flow.manager)
 
             task_workdir = os.path.join(self.workdir, "t" + str(i))
 
@@ -526,8 +638,8 @@ class Work(BaseWork, NodeContainer):
         Registers a new :class:`Task` and add it to the internal list, taking into account possible dependencies.
 
         Args:
-            obj: :class:`AbinitInput` instance.
-            deps: Dictionary specifying the dependency of this node.
+            obj: :class:`AbinitInput` instance or `Task` object.
+            deps: Dictionary specifying the dependency of this node or list of dependencies
                   None means that this obj has no dependency.
             required_files: List of strings with the path of the files used by the task.
                 Note that the files must exist when the task is registered.
@@ -557,9 +669,10 @@ class Work(BaseWork, NodeContainer):
 
         self._tasks.append(task)
 
-        # Handle possible dependencies.
+        # Handle possible dependencies given either as dict or list.
         if deps is not None:
-            deps = [Dependency(node, exts) for node, exts in deps.items()]
+            if hasattr(deps, "items"):
+                deps = [Dependency(node, exts) for node, exts in deps.items()]
             task.add_deps(deps)
 
         # Handle possible dependencies.
@@ -843,7 +956,7 @@ class BandStructureWork(Work):
                 ngkpt = task.get_inpvar("ngkpt")
                 plotter.add_edos("ngkpt %s" % str(ngkpt), edos)
 
-        return plotter.plot(**kwargs)
+        return plotter.combiplot(**kwargs)
 
 
 class RelaxWork(Work):
@@ -944,55 +1057,57 @@ class G0W0Work(Work):
                  workdir=None, manager=None):
         """
         Args:
-            scf_inputs: Input for the SCF run, if it is a list add all but only link
+            scf_inputs: Input(s) for the SCF run, if it is a list add all but only link
                 to the last input (used for convergence studies on the KS band gap)
-            nscf_inputs: Input for the NSCF run, if it is a list add all but only
+            nscf_inputs: Input(s) for the NSCF run, if it is a list add all but only
                 link to the last (i.e. addditiona DOS and BANDS)
             scr_inputs: Input for the screening run
             sigma_inputs: List of :class:AbinitInput`for the self-energy run.
-                if scr and sigma are lists of the same length every sigma gets it's own screening
-                if there is only one screening all sigma's link to this one
+                if scr and sigma are lists of the same length, every sigma gets its own screening.
+                if there is only one screening all sigma inputs are linked to this one
             workdir: Working directory of the calculation.
             manager: :class:`TaskManager` object.
         """
         super(G0W0Work, self).__init__(workdir=workdir, manager=manager)
 
-        if isinstance(sigma_inputs, list) and isinstance(scr_inputs, list) and len(sigma_inputs) == len(scr_inputs):
-            spread_scr = True
-        else:
-            spread_scr = False
+        spread_scr = (isinstance(sigma_inputs, (list, tuple)) and
+                      isinstance(scr_inputs, (list, tuple)) and
+                      len(sigma_inputs) == len(scr_inputs))
+        #print("spread_scr", spread_scr)
 
         self.sigma_tasks = []
 
         # Register the GS-SCF run.
         # register all scf_inputs but link the nscf only the last scf in the list
         # multiple scf_inputs can be provided to perform convergence studies
-
-        if isinstance(scf_inputs, list):
+        if isinstance(scf_inputs, (list, tuple)):
             for scf_input in scf_inputs:
                 self.scf_task = self.register_scf_task(scf_input)
         else:
             self.scf_task = self.register_scf_task(scf_inputs)
 
         # Register the NSCF run (s).
-
-        if isinstance(nscf_inputs, list):
+        if isinstance(nscf_inputs, (list, tuple)):
             for nscf_input in nscf_inputs:
                 self.nscf_task = nscf_task = self.register_nscf_task(nscf_input, deps={self.scf_task: "DEN"})
         else:
             self.nscf_task = nscf_task = self.register_nscf_task(nscf_inputs, deps={self.scf_task: "DEN"})
 
         # Register the SCR and SIGMA run(s).
-
         if spread_scr:
             for scr_input, sigma_input in zip(scr_inputs, sigma_inputs):
                 scr_task = self.register_scr_task(scr_input, deps={nscf_task: "WFK"})
                 sigma_task = self.register_sigma_task(sigma_input, deps={nscf_task: "WFK", scr_task: "SCR"})
                 self.sigma_tasks.append(sigma_task)
         else:
+            # Sigma work(s) connected to the same screening.
             scr_task = self.register_scr_task(scr_inputs, deps={nscf_task: "WFK"})
-            for sigma_input in sigma_inputs:
-                task = self.register_sigma_task(sigma_input, deps={nscf_task: "WFK", scr_task: "SCR"})
+            if isinstance(sigma_inputs, (list, tuple)):
+                for inp in sigma_inputs:
+                    task = self.register_sigma_task(inp, deps={nscf_task: "WFK", scr_task: "SCR"})
+                    self.sigma_tasks.append(task)
+            else:
+                task = self.register_sigma_task(sigma_inputs, deps={nscf_task: "WFK", scr_task: "SCR"})
                 self.sigma_tasks.append(task)
 
 
@@ -1154,104 +1269,6 @@ class QptdmWork(Work):
         return self.Results(node=self, returncode=0, message="mrgscr done", final_scr=final_scr)
 
 
-@deprecated(message="This class is deprecated and will be removed in pymatgen 4.0. Use PhononWork")
-def build_oneshot_phononwork(scf_input, ph_inputs, workdir=None, manager=None, work_class=None):
-    """
-    Returns a work for the computation of phonon frequencies
-    ph_inputs is a list of input for Phonon calculation in which all the independent perturbations
-    are explicitly computed i.e.
-
-        * rfdir 1 1 1
-        * rfatpol 1 natom
-
-    .. warning::
-        This work is mainly used for simple calculations, e.g. convergence studies.
-        Use :class:`PhononWork` for better efficiency.
-    """
-    work_class = OneShotPhononWork if work_class is None else work_class
-    work = work_class(workdir=workdir, manager=manager)
-    scf_task = work.register_scf_task(scf_input)
-    ph_inputs = [ph_inputs] if not isinstance(ph_inputs, (list, tuple)) else ph_inputs
-
-    for phinp in ph_inputs:
-        # Check rfdir and rfatpol.
-        rfdir = np.array(phinp.get("rfdir", [0, 0, 0]))
-        if len(rfdir) != 3 or any(rfdir != (1, 1, 1)):
-            raise ValueError("Expecting rfdir == (1, 1, 1), got %s" % rfdir)
-
-        rfatpol = np.array(phinp.get("rfatpol", [1, 1]))
-        if len(rfatpol) != 2 or any(rfatpol != (1, len(phinp.structure))):
-            raise ValueError("Expecting rfatpol == (1, natom), got %s" % rfatpol)
-
-        # cannot use PhononTaks here because the Task is not able to deal with multiple phonon calculations
-        ph_task = work.register(phinp, deps={scf_task: "WFK"})
-
-    return work
-
-
-class OneShotPhononWork(Work):
-    """
-    Simple and very inefficient work for the computation of the phonon frequencies
-    It consists of a GS task and a DFPT calculations for all the independent perturbations.
-    The main advantage is that one has direct access to the phonon frequencies that
-    can be computed at the end of the second task without having to call anaddb.
-
-    Use ``build_oneshot_phononwork`` to construct this work from the input files.
-    """
-    @deprecated(message="This class is deprecated and will be removed in pymatgen 4.0. Use PhononWork")
-    def read_phonons(self):
-        """
-        Read phonon frequencies from the output file.
-
-        Return:
-            List of namedtuples. Each `namedtuple` has the following attributes:
-
-                - qpt: ndarray with the q-point in reduced coordinates.
-                - freqs: ndarray with 3 x Natom phonon frequencies in meV
-        """
-        #
-        #   Phonon wavevector (reduced coordinates) :  0.00000  0.00000  0.00000
-        #  Phonon energies in Hartree :
-        #    1.089934E-04  4.990512E-04  1.239177E-03  1.572715E-03  1.576801E-03
-        #    1.579326E-03
-        #  Phonon frequencies in cm-1    :
-        # -  2.392128E+01  1.095291E+02  2.719679E+02  3.451711E+02  3.460677E+02
-        # -  3.466221E+02
-        BEGIN = "  Phonon wavevector (reduced coordinates) :"
-        END = " Phonon frequencies in cm-1    :"
-
-        ph_tasks, qpts, phfreqs = self[1:], [], []
-        for task in ph_tasks:
-
-            # Parse output file.
-            with open(task.output_file.path, "r") as fh:
-                qpt, inside = None, 0
-                for line in fh:
-                    if line.startswith(BEGIN):
-                        qpts.append([float(s) for s in line[len(BEGIN):].split()])
-                        inside, omegas = 1, []
-                    elif line.startswith(END):
-                        break
-                    elif inside:
-                        inside += 1
-                        if inside > 2:
-                            omegas.extend((float(s) for s in line.split()))
-                else:
-                    raise ValueError("Cannot find %s in file %s" % (END, task.output_file.path))
-
-                phfreqs.append(omegas)
-
-        # Use namedtuple to store q-point and frequencies in meV
-        phonon = collections.namedtuple("phonon", "qpt freqs")
-        return [phonon(qpt=qpt, freqs=freqs_meV) for qpt, freqs_meV in zip(qpts, EnergyArray(phfreqs, "Ha").to("meV") )]
-
-    def get_results(self, **kwargs):
-        results = super(OneShotPhononWork, self).get_results()
-        phonons = self.read_phonons()
-        results.update(phonons=phonons)
-        return results
-
-
 class MergeDdb(object):
     """Mixin class for Works that have to merge the DDB files produced by the tasks."""
 
@@ -1291,11 +1308,13 @@ class PhononWork(Work, MergeDdb):
     """
     This work usually consists of one GS + nirred Phonon tasks where nirred is
     the number of irreducible perturbations for a given q-point.
-    It provides the callback method (on_all_ok) that calls mrgddb to merge the partial DDB files produced
+    It provides the callback method (on_all_ok) that calls mrgddb (mrgdv) to merge
+    all the partial DDB (POT) files produced. The two files are available in the
+    output directory of the Work.
     """
 
     @classmethod
-    def from_scf_task(cls, scf_task, qpoints, tolerance=None, manager=None):
+    def from_scf_task(cls, scf_task, qpoints, is_ngqpt=False, tolerance=None, manager=None):
         """
         Construct a `PhononWork` from a :class:`ScfTask` object.
         The input file for phonons is automatically generated from the input of the ScfTask.
@@ -1303,7 +1322,9 @@ class PhononWork(Work, MergeDdb):
 
         Args:
             scf_task: ScfTask object.
-            qpoints: q-points in reduced coordinates. Accepts single q-point or list of q-points
+            qpoints: q-points in reduced coordinates. Accepts single q-point, list of q-points
+                or three integers defining the q-mesh if `is_ngqpt`.
+            is_ngqpt: True if `qpoints` should be interpreted as divisions instead of q-points.
             tolerance: dict {varname: value} with the tolerance to be used in the DFPT run.
                 Defaults to {"tolvrs": 1.0e-10}.
             manager: :class:`TaskManager` object.
@@ -1311,7 +1332,10 @@ class PhononWork(Work, MergeDdb):
         if not isinstance(scf_task, ScfTask):
             raise TypeError("task %s does not inherit from ScfTask" % scf_task)
 
-        qpoints = np.reshape(qpoints, (-1,3))
+        if is_ngqpt:
+            qpoints = scf_task.input.abiget_ibz(ngkpt=qpoints, shiftk=[0, 0, 0], kptopt=1).points
+
+        qpoints = np.reshape(qpoints, (-1, 3))
 
         new = cls(manager=manager)
         for qpt in qpoints:
@@ -1322,13 +1346,16 @@ class PhononWork(Work, MergeDdb):
         return new
 
     @classmethod
-    def from_scf_input(cls, scf_input, qpoints, tolerance=None, manager=None):
+    def from_scf_input(cls, scf_input, qpoints, is_ngqpt=False, tolerance=None, manager=None):
         """
         Similar to `from_scf_task`, the difference is that this method requires
         an input for SCF calculation instead of a ScfTask. All the tasks (Scf + Phonon)
         are packed in a single Work whereas in the previous case we usually have multiple works.
         """
-        qpoints = np.reshape(qpoints, (-1,3))
+        if is_ngqpt:
+            qpoints = scf_input.abiget_ibz(ngkpt=qpoints, shiftk=[0, 0, 0], kptopt=1).points
+
+        qpoints = np.reshape(qpoints, (-1, 3))
 
         new = cls(manager=manager)
         scf_task = new.register_scf_task(scf_input)
@@ -1421,6 +1448,69 @@ class BecWork(Work, MergeDdb):
         bec_inputs = scf_task.input.make_bec_inputs() #tolerance=efile
         for bec_inp in bec_inputs:
              new.register_bec_task(bec_inp, deps=bec_deps)
+
+        return new
+
+    def on_all_ok(self):
+        """
+        This method is called when all the task reach S_OK
+        Ir runs `mrgddb` in sequential on the local machine to produce
+        the final DDB file in the outdir of the `Work`.
+        """
+        # Merge DDB files.
+        out_ddb = self.merge_ddb_files()
+        results = self.Results(node=self, returncode=0, message="DDB merge done")
+        results.register_gridfs_files(DDB=(out_ddb, "t"))
+
+        return results
+
+
+class DteWork(Work, MergeDdb):
+    """
+    Work for the computation of the third derivative of the energy.
+
+    This work consists of DDK tasks and electric field perturbation.
+    It provides the callback method (on_all_ok) that calls mrgddb to merge the partial DDB files produced
+    """
+    @classmethod
+    def from_scf_task(cls, scf_task, ddk_tolerance=None):
+        """Build a DteWork from a ground-state task."""
+        if not isinstance(scf_task, ScfTask):
+            raise TypeError("task %s does not inherit from GsTask" % scf_task)
+
+        new = cls() #manager=scf_task.manager)
+
+        # DDK calculations
+        multi_ddk = scf_task.input.make_ddk_inputs(tolerance=ddk_tolerance)
+
+        ddk_tasks = []
+        for ddk_inp in multi_ddk:
+            ddk_task = new.register_ddk_task(ddk_inp, deps={scf_task: "WFK"})
+            ddk_tasks.append(ddk_task)
+
+        # Build the list of inputs for electric field perturbation
+        # Each task is connected to all the previous DDK, DDE task and to the scf_task.
+
+        multi_dde = scf_task.input.make_dde_inputs(use_symmetries=False)
+        # To compute the nonlinear coefficients all the directions of the perturbation
+        # have to be taken in consideration
+        # DDE calculations
+        dde_tasks = []
+        dde_deps = {ddk_task: "DDK" for ddk_task in ddk_tasks}
+        dde_deps.update({scf_task: "WFK"})
+        for dde_inp in multi_dde:
+            dde_task = new.register_dde_task(dde_inp, deps=dde_deps)
+            dde_tasks.append(dde_task)
+
+        #DTE calculations
+        dte_deps = {scf_task: "WFK DEN"}
+        dte_deps.update({dde_task: "1WF 1DEN" for dde_task in dde_tasks})
+
+        multi_dte = scf_task.input.make_dte_inputs()
+        dte_tasks = []
+        for dte_inp in multi_dte:
+             dte_task = new.register_dte_task(dte_inp, deps=dte_deps)
+             dte_tasks.append(dte_task)
 
         return new
 

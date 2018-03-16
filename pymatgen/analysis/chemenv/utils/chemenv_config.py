@@ -3,6 +3,12 @@
 # Distributed under the terms of the MIT License.
 
 from __future__ import division, unicode_literals
+from pymatgen.analysis.chemenv.utils.scripts_utils import strategies_class_lookup
+from os.path import expanduser, exists
+from os import makedirs
+import json
+from six.moves import input
+from pymatgen import SETTINGS
 
 """
 This module contains the classes for configuration of the chemenv package.
@@ -16,12 +22,6 @@ __maintainer__ = "David Waroquiers"
 __email__ = "david.waroquiers@gmail.com"
 __date__ = "Feb 20, 2016"
 
-
-from pymatgen.analysis.chemenv.utils.chemenv_errors import ChemenvError
-from pymatgen.analysis.chemenv.utils.scripts_utils import strategies_class_lookup
-from os.path import expanduser, exists
-from os import makedirs
-import json
 
 
 class ChemEnvConfig():
@@ -39,8 +39,13 @@ class ChemEnvConfig():
                                'default_max_distance_factor': 1.5
                                }
 
-    def __init__(self, materials_project_configuration=None, package_options=None):
-        self.materials_project_configuration = materials_project_configuration
+    def __init__(self, package_options=None):
+        if SETTINGS.get("PMG_MAPI_KEY", "") != "": 
+            self.materials_project_configuration = SETTINGS.get("PMG_MAPI_KEY", "")
+        else:
+            self.materials_project_configuration = None
+
+
         if package_options is None:
             self.package_options = self.DEFAULT_PACKAGE_OPTIONS
         else:
@@ -58,13 +63,10 @@ class ChemEnvConfig():
             for key, val in self.package_options.items():
                 print('     {}   :   {}'.format(str(key), str(val)))
             print('\nChoose in the following :')
-            print(' <1> + <ENTER> : setup of the access to the materials project database')
-            print(' <2> + <ENTER> : configuration of the package options (strategy, ...)')
+            print(' <1> + <ENTER> : configuration of the package options (strategy, ...)')
             print(' <q> + <ENTER> : quit without saving configuration')
-            test = raw_input(' <S> + <ENTER> : save configuration and quit\n ... ')
+            test = input(' <S> + <ENTER> : save configuration and quit\n ... ')
             if test == '1':
-                self.setup_materials_project_configuration()
-            elif test == '2':
                 self.setup_package_options()
             elif test == 'q':
                 break
@@ -77,10 +79,6 @@ class ChemEnvConfig():
         if test == 'S':
             print('Configuration has been saved to file "{}"'.format(config_file))
 
-    def setup_materials_project_configuration(self):
-        api_key = raw_input('\nEnter your Materials Project API key : ')
-        self.materials_project_configuration = {'api_key': api_key}
-
     @property
     def has_materials_project_access(self):
         return self.materials_project_configuration is not None
@@ -91,7 +89,7 @@ class ChemEnvConfig():
         strategies = list(strategies_class_lookup.keys())
         for istrategy, strategy in enumerate(strategies):
             print(' <{}> : {}'.format(str(istrategy + 1), strategy))
-        test = raw_input(' ... ')
+        test = input(' ... ')
         self.package_options['default_strategy'] = {'strategy': strategies[int(test) - 1], 'strategy_options': {}}
         strategy_class = strategies_class_lookup[strategies[int(test) - 1]]
         if len(strategy_class.STRATEGY_OPTIONS) > 0:
@@ -102,7 +100,7 @@ class ChemEnvConfig():
                                                                 str(option_dict['default'])))
                     print('     Valid options are :\n')
                     print('       {}'.format(option_dict['type'].allowed_values))
-                    test = raw_input('     Your choice : ')
+                    test = input('     Your choice : ')
                     if test == '':
                         self.package_options['default_strategy']['strategy_options'][option] = option_dict['type'](strategy_class.STRATEGY_OPTIONS[option]['default'])
                         break
@@ -130,11 +128,10 @@ class ChemEnvConfig():
             root_dir = '{}/.chemenv'.format(home)
         if not exists(root_dir):
             makedirs(root_dir)
-        config_dict = {'materials_project_configuration': self.materials_project_configuration,
-                       'package_options': self.package_options}
+        config_dict = {'package_options': self.package_options}  
         config_file = '{}/config.json'.format(root_dir)
         if exists(config_file):
-            test = raw_input('Overwrite existing configuration ? (<Y> + <ENTER> to confirm)')
+            test = input('Overwrite existing configuration ? (<Y> + <ENTER> to confirm)')
             if test != 'Y':
                 print('Configuration not saved')
                 return config_file
@@ -154,15 +151,9 @@ class ChemEnvConfig():
             f = open(config_file, 'r')
             config_dict = json.load(f)
             f.close()
-            return ChemEnvConfig(materials_project_configuration=config_dict['materials_project_configuration'],
-                                 package_options=config_dict['package_options'])
+            return ChemEnvConfig(package_options=config_dict['package_options']) 
+            
         except IOError:
             print('Unable to load configuration from file "{}" ...'.format(config_file))
             print(' ... loading default configuration')
             return ChemEnvConfig()
-
-    @property
-    def materials_project_api_key(self):
-        if self.materials_project_configuration is None:
-            raise ChemenvError('ChemEnvConfig', 'materials_project_api_key', 'No api_key saved')
-        return self.materials_project_configuration['api_key']
